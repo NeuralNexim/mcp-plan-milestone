@@ -1,28 +1,47 @@
 #!/usr/bin/env python3
 """
-MCP server: plan-milestone plugin
-Provides tools that support the /plan-milestone skill in NexTinyOS.
+MCP server: plan-milestone
+Provides tools that support the /plan-milestone skill.
+
+Generates structured implementation-plan document sets (top-level + sub-plans)
+from a project's roadmap file and existing plan templates.
+
+Project-agnostic: works with any project that keeps plan docs in .github/ and
+a roadmap / dev-plan file somewhere in the repo. All paths are auto-detected or
+can be overridden via parameters.
 """
 
 import os
 import re
-import glob
-import json
+import subprocess
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("plan-milestone")
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Repo-root detection
 # ---------------------------------------------------------------------------
 
+_ROOT_SENTINELS = (
+    ".github",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "README.md",
+    "Makefile",
+    "CMakeLists.txt",
+    "pyproject.toml",
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+)
+
+
 def _repo_root() -> Path:
-    """Return the NexTinyOS repo root (or cwd if not detectable)."""
+    """Return the project root by walking up from cwd."""
     cwd = Path.cwd()
-    sentinels = ("kernel/kernel.c", "kernel/shell_cmd.h", "Makefile")
     for p in [cwd, *cwd.parents]:
-        if any((p / s).exists() for s in sentinels):
+        if any((p / s).exists() for s in _ROOT_SENTINELS):
             return p
     return cwd
 
@@ -30,73 +49,128 @@ def _repo_root() -> Path:
 def _read(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         return ""
 
 
 # ---------------------------------------------------------------------------
-# Tool: hwcap_check
+# Path auto-detection helpers
+# ---------------------------------------------------------------------------
+
+def _find_dev_plan(root: Path) -> Path | None:
+    """Locate the project's development / roadmap plan file."""
+    candidates = [
+        root / ".github" / "prompts" / "plan-developmentPlan.prompt.md",
+        root / ".github" / "ROADMAP.md",
+        root / "ROADMAP.md",
+        root / "docs" / "roadmap.md",
+        root / "docs" / "development-plan.md",
+    ]
+    for p in (root / ".github" / "prompts").glob("*.prompt.md"):
+        candidates.append(p)
+    return next((p for p in candidates if p.exists()), None)
+
+
+def _find_capability_header(root: Path) -> Path | None:
+    """Locate a source file that defines capability / feature-flag bits."""
+    candidates = [
+        root / "kernel" / "hwcaps.h",
+        root / "include" / "caps.h",
+        root / "include" / "features.h",
+        root / "src" / "caps.h",
+        root / "src" / "features.h",
+    ]
+    for pattern in ("**/caps.h", "**/hwcaps.h", "**/features.h", "**/feature_flags.h"):
+        for p in root.glob(pattern):
+            if "build" not in p.parts and "vendor" not in p.parts:
+                candidates.append(p)
+    return next((p for p in candidates if p.exists()), None)
+
+
+def _find_init_file(root: Path) -> Path | None:
+    """Locate the file containing the project's main init / boot sequence."""
+    candidates = [
+        root / "kernel" / "kernel.c",
+        root / "src" / "main.c",
+        root / "src" / "main.rs",
+        root / "src" / "main.go",
+        root / "main.c",
+        root / "main.rs",
+        root / "main.go",
+        root / "src" / "app.c",
+        root / "src" / "boot.c",
+    ]
+    return next((p for p in candidates if p.exists()), None)
+
+
+def _find_plan_dir(root: Path) -> Path:
+    """Return the directory where plan-*.md files live."""
+    for candidate in (root / ".github", root / "docs" / "plans", root / "plans"):
+        if candidate.exists() and list(candidate.glob("plan-*.md")):
+            return candidate
+    return root / ".github"
+
+
+# ---------------------------------------------------------------------------
+# Tool: capability_check
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def hwcap_check() -> dict:
+def capability_check(header_path: str = "") -> dict:
     """
-    Parse kernel/hwcaps.h and return:
-      - current_bits: list of {name, value, hex} for every HWCAP_* define
-      - next_bit_index: integer index (e.g. 4 means next is 1<<4)
-      - next_bit_value: hex string (e.g. "0x10")
-      - raw_snippet: the relevant lines from hwcaps.h
+    Parse a capability / feature-flag header and return current bit assignments
+    plus the next free slot.
 
-    Use this before assigning new HWCAP_* values to avoid collisions.
+    Looks for lines of the form:
+        #define SOME_CAP  (1 << N)
+        #define SOME_CAP  1<<N
+        #define SOME_CAP  0x...   (single-bit hex values only)
+
+    Parameters:
+      header_path — override auto-detection; leave empty to auto-detect.
+
+    Returns: {source, current_caps, next_bit_index, next_bit_value, next_bit_define}
     """
     root = _repo_root()
-    src = _read(root / "kernel" / "hwcaps.h")
-    bits = []
-    source = "kernel/hwcaps.h"
+    path = Path(header_path) if header_path else _find_capability_header(root)
+    src = _read(path) if path else ""
+    caps = []
+    source = str(path) if path else "not found"
 
     if src:
-        pattern = re.compile(r"#define\s+(HWCAP_\w+)\s+\(1\s*<<\s*(\d+)\)")
-        for m in pattern.finditer(src):
+        for m in re.finditer(r"#define\s+(\w+)\s+\(?\s*1\s*<<\s*(\d+)\s*\)?", src):
             name, idx = m.group(1), int(m.group(2))
-            bits.append({"name": name, "bit_index": idx, "value": 1 << idx,
-                         "hex": f"0x{1 << idx:02X}"})
+            caps.append({"name": name, "bit_index": idx,
+                         "value": 1 << idx, "hex": f"0x{1 << idx:02X}"})
+        for m in re.finditer(r"#define\s+(\w+)\s+(0x[0-9A-Fa-f]+)\b", src):
+            val = int(m.group(2), 16)
+            if val and (val & (val - 1)) == 0:
+                idx = val.bit_length() - 1
+                if not any(c["name"] == m.group(1) for c in caps):
+                    caps.append({"name": m.group(1), "bit_index": idx,
+                                 "value": val, "hex": f"0x{val:02X}"})
     else:
-        # hwcaps.h not yet created (pre-implementation branch).
-        # Try extracting HWCAP symbols from build/hwcaps.o via nm.
-        source = "build/hwcaps.o (nm fallback — hwcaps.h not yet created)"
-        obj = root / "build" / "hwcaps.o"
-        if obj.exists():
-            import subprocess
+        # Try nm on compiled objects as a last resort
+        nm_names = []
+        for obj in list(root.glob("build/**/*.o"))[:5]:
             try:
-                nm_out = subprocess.check_output(["nm", str(obj)],
-                                                  stderr=subprocess.DEVNULL,
-                                                  text=True)
-                # nm won't give us #define values; report what's known from plan docs
+                out = subprocess.check_output(["nm", str(obj)],
+                                               stderr=subprocess.DEVNULL, text=True)
+                nm_names += re.findall(r"\b(\w*[Cc]ap\w*|\w*[Ff]eature\w*)\b", out)
             except Exception:
                 pass
-        # Fall back to known R0011 constants (documented in CLAUDE.md)
-        known = [
-            ("HWCAP_CPUID", 0), ("HWCAP_FPU", 1),
-            ("HWCAP_FXSR", 2), ("HWCAP_SSE", 3),
-        ]
-        for name, idx in known:
-            bits.append({"name": name, "bit_index": idx, "value": 1 << idx,
-                         "hex": f"0x{1 << idx:02X}"})
-        source += " + CLAUDE.md known bits"
+        source = f"header not found; nm symbols: {list(dict.fromkeys(nm_names))[:10]}"
 
-    bits.sort(key=lambda b: b["bit_index"])
-    next_idx = (bits[-1]["bit_index"] + 1) if bits else 0
+    caps.sort(key=lambda c: c["bit_index"])
+    next_idx = (caps[-1]["bit_index"] + 1) if caps else 0
     next_val = 1 << next_idx
 
-    snippet_lines = [l for l in src.splitlines() if "HWCAP_" in l or "hwcaps" in l.lower()] if src else []
     return {
         "source": source,
-        "current_bits": bits,
+        "current_caps": caps,
         "next_bit_index": next_idx,
         "next_bit_value": f"0x{next_val:02X}",
         "next_bit_define": f"(1 << {next_idx})",
-        "raw_snippet": "\n".join(snippet_lines),
-        "note": "" if src else "hwcaps.h will be created in R0012a; current_bits derived from CLAUDE.md",
     }
 
 
@@ -105,43 +179,52 @@ def hwcap_check() -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def plan_template(milestone: str = "") -> dict:
+def plan_template(milestone: str = "", plan_dir: str = "") -> dict:
     """
-    Return the plan files for the most recently completed milestone as
-    template text. If `milestone` is given (e.g. "R0011") that specific
-    milestone's files are returned; otherwise the highest-numbered complete
-    set is auto-detected.
+    Return the plan files for a completed milestone as template text.
 
-    Returns a dict with keys: top_level, sub_a, sub_b, sub_c.
-    Each value is the full file text (empty string if not found).
+    If `milestone` is given (e.g. "R0011", "v2.3") that set is returned;
+    otherwise the highest-numbered complete set (top + a + b + c) is used.
+
+    Parameters:
+      milestone — optional milestone tag to fetch
+      plan_dir  — override auto-detected plan directory
+
+    Returns: {milestone, plan_dir, top_level, sub_a, sub_b, sub_c}
     """
     root = _repo_root()
-    github = root / ".github"
+    pdir = Path(plan_dir) if plan_dir else _find_plan_dir(root)
 
     if milestone:
-        tag = milestone.upper().lstrip("R").lstrip("0") or "0"
-        tag = f"R{int(tag):04d}" if tag.isdigit() else milestone.upper()
+        m = re.match(r"[Rr]?0*(\d+)", milestone)
+        tag = f"R{int(m.group(1)):04d}" if m else milestone
     else:
-        # find highest complete set (top + a + b + c all exist)
-        tops = sorted(github.glob("plan-R????.md"))
         tag = None
-        for top in reversed(tops):
+        for top in sorted(pdir.glob("plan-R????.md"), reverse=True):
             m = re.search(r"plan-(R\d{4})\.md$", top.name)
             if not m:
                 continue
             t = m.group(1)
-            if all((github / f"plan-{t}{s}.md").exists() for s in ("a", "b", "c")):
+            if all((pdir / f"plan-{t}{s}.md").exists() for s in ("a", "b", "c")):
                 tag = t
                 break
-        if tag is None:
-            return {"error": "No complete milestone plan set found in .github/"}
+        if not tag:
+            tops = sorted(pdir.glob("plan-*.md"), reverse=True)
+            if tops:
+                tag = re.search(r"plan-(\w+)\.md$", tops[0].name).group(1)
+            else:
+                return {"error": f"No plan files found in {pdir}"}
 
     def _r(suffix):
-        fname = f"plan-{tag}{suffix}.md"
-        return _read(github / fname)
+        for fname in (f"plan-{tag}{suffix}.md", f"plan_{tag}{suffix}.md"):
+            text = _read(pdir / fname)
+            if text:
+                return text
+        return ""
 
     return {
         "milestone": tag,
+        "plan_dir": str(pdir),
         "top_level": _r(""),
         "sub_a":     _r("a"),
         "sub_b":     _r("b"),
@@ -154,81 +237,94 @@ def plan_template(milestone: str = "") -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def milestone_entry(milestone: str) -> dict:
+def milestone_entry(milestone: str, dev_plan_path: str = "") -> dict:
     """
-    Extract the roadmap entry for `milestone` (e.g. "R0012") from
-    .github/prompts/plan-developmentPlan.prompt.md.
+    Extract the roadmap / dev-plan entry for a milestone.
 
-    Returns:
-      - entry_text: the relevant block of text
-      - file_list: lines that look like file paths within that block
-      - nexlib_goals: lines mentioning nexlib within that block
+    Parameters:
+      milestone     — tag to search for (e.g. "R0012", "v3.0", "PHASE-4")
+      dev_plan_path — override auto-detection of the roadmap file
+
+    Returns: {milestone, source_file, entry_text, file_list, feature_goals}
     """
     root = _repo_root()
-    src = _read(root / ".github" / "prompts" / "plan-developmentPlan.prompt.md")
-    if not src:
-        return {"error": "plan-developmentPlan.prompt.md not found"}
+    path = Path(dev_plan_path) if dev_plan_path else _find_dev_plan(root)
 
-    tag = milestone.upper()
-    # Find the section header for this milestone and grab until the next one
+    if not path:
+        return {"error": "No development plan / roadmap file found. "
+                         "Pass dev_plan_path explicitly."}
+
+    src = _read(path)
+    if not src:
+        return {"error": f"Could not read {path}"}
+
+    tag = milestone.strip()
     section_re = re.compile(
-        rf"(#+\s+.*?{re.escape(tag)}.*?)(?=\n#+\s+[A-Z]|\Z)", re.DOTALL
+        rf"(#+\s+.*?{re.escape(tag)}.*?)(?=\n#+\s|\Z)", re.DOTALL
     )
     m = section_re.search(src)
-    if not m:
-        # Fallback: grab 120 lines surrounding first occurrence
+    if m:
+        entry = m.group(0)
+    else:
         idx = src.find(tag)
         if idx == -1:
-            return {"error": f"{tag} not found in development plan"}
-        start = max(0, src.rfind("\n", 0, idx) - 200)
-        end = min(len(src), idx + 3000)
-        entry = src[start:end]
-    else:
-        entry = m.group(0)
+            return {"error": f"'{tag}' not found in {path}"}
+        start = max(0, src.rfind("\n\n", 0, idx))
+        entry = src[start:min(len(src), idx + 3000)]
 
     file_lines = [l.strip() for l in entry.splitlines()
-                  if re.search(r"[a-z_/]+\.[ch]", l)]
-    nexlib_lines = [l.strip() for l in entry.splitlines()
-                    if "nexlib" in l.lower()]
+                  if re.search(r"[a-zA-Z_/][a-zA-Z0-9_/.-]+\.[a-zA-Z]{1,5}", l)
+                  and not l.strip().startswith("#")]
+
+    feature_lines = [l.strip() for l in entry.splitlines()
+                     if re.search(r"\b(add|impl|introduce|support|enable|extend|"
+                                  r"replace|upgrade|migrate|new)\b", l, re.I)
+                     and len(l.strip()) > 10]
 
     return {
         "milestone": tag,
+        "source_file": str(path),
         "entry_text": entry,
-        "file_list": file_lines,
-        "nexlib_goals": nexlib_lines,
+        "file_list": file_lines[:40],
+        "feature_goals": feature_lines[:20],
     }
 
 
 # ---------------------------------------------------------------------------
-# Tool: boot_sequence
+# Tool: init_sequence
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def boot_sequence() -> dict:
+def init_sequence(init_file_path: str = "") -> dict:
     """
-    Extract the kernel init sequence from kernel/kernel.c (the main()
-    function body) so that new *_init() calls can be slotted in at the
-    correct position.
+    Extract the application's startup / initialisation call order so that new
+    init calls can be slotted in at the correct position.
 
-    Returns:
-      - init_calls: ordered list of *_init() / subsystem calls found in main()
-      - raw_main: full text of the main() function
+    Parameters:
+      init_file_path — override auto-detection (looks for main.c, kernel.c, etc.)
+
+    Returns: {source_file, init_calls, raw_main}
     """
     root = _repo_root()
-    src = _read(root / "kernel" / "kernel.c")
-    if not src:
-        return {"error": "kernel/kernel.c not found"}
+    path = Path(init_file_path) if init_file_path else _find_init_file(root)
 
-    # Extract main() body
-    m = re.search(r"\bvoid\s+main\s*\(.*?\)\s*\{", src)
+    if not path:
+        return {"error": "No init / main file found. Pass init_file_path explicitly."}
+
+    src = _read(path)
+    if not src:
+        return {"error": f"Could not read {path}"}
+
+    main_re = re.compile(
+        r"\b(?:void|int)\s+(?:main|kernel_main|app_main|boot_main|start)\s*\([^)]*\)\s*\{",
+        re.MULTILINE,
+    )
+    m = main_re.search(src)
     if not m:
-        m = re.search(r"\bint\s+main\s*\(.*?\)\s*\{", src)
-    if not m:
-        return {"error": "main() not found in kernel.c", "src_preview": src[:500]}
+        return {"error": f"No main() function found in {path}", "src_preview": src[:500]}
 
     start = m.end()
-    depth = 1
-    pos = start
+    depth, pos = 1, start
     while pos < len(src) and depth:
         if src[pos] == "{":
             depth += 1
@@ -237,13 +333,11 @@ def boot_sequence() -> dict:
         pos += 1
     raw_main = src[m.start():pos]
 
-    init_re = re.compile(r"\b(\w+_init|hwcaps_probe|pic_init|pit_init|scheduler_\w+)\s*\(")
-    calls = []
-    for lm in init_re.finditer(raw_main):
-        line_no = src[:m.start() + (lm.start() - len(src[m.start():lm.start()]) + lm.start() - m.start())].count("\n") + 1
-        calls.append(lm.group(0).rstrip("("))
+    init_re = re.compile(r"\b(\w+(?:_init|_setup|_start|_probe|_enable))\s*\(")
+    calls = list(dict.fromkeys(im.group(1) for im in init_re.finditer(raw_main)))
 
     return {
+        "source_file": str(path),
         "init_calls": calls,
         "raw_main": raw_main,
     }
@@ -253,78 +347,94 @@ def boot_sequence() -> dict:
 # Tool: validate_plan_file
 # ---------------------------------------------------------------------------
 
+_REQUIRED_HEADINGS = {
+    "":  ["Prior Release Context", "Overview", "Goals",
+          "Test Results", "Sub-Phase Summary"],
+    "a": ["Prior Release Context", "Overview", "Implementation",
+          "Files", "Test Coverage", "Commit Message"],
+    "b": ["Prior Release Context", "Overview", "Implementation",
+          "Files", "Test Coverage", "Commit Message"],
+    "c": ["Prior Release Context", "Overview", "Implementation",
+          "Files", "Test Coverage", "Commit Message"],
+}
+
+_ASSERTION_FLOOR = {"": 0, "a": 30, "b": 30, "c": 60}
+
+
 @mcp.tool()
-def validate_plan_file(content: str, sub_phase: str = "") -> dict:
+def validate_plan_file(
+    content: str,
+    sub_phase: str = "",
+    language: str = "c",
+    extra_forbidden_tokens: str = "",
+) -> dict:
     """
-    Validate a plan document before writing it to disk.
-    `content` is the full markdown text; `sub_phase` is "", "a", "b", or "c".
+    Validate a plan document before writing it.
 
-    Checks:
-      - Required section headings are present
-      - Code blocks use correct C style (no size_t, no tabs, brace-on-same-line)
-      - HWCAP values cited in the text don't collide with existing bits
-      - Test assertion count floor: top≥0, a≥30, b≥30, c≥60
-      - No forbidden libc includes (#include <string.h> etc.)
+    Parameters:
+      content                — full markdown text of the plan
+      sub_phase              — "", "a", "b", or "c"
+      language               — primary language for code-block style checks
+                               ("c", "rust", "go", "python", …); use "" to skip
+      extra_forbidden_tokens — comma-separated tokens to flag in code blocks
 
-    Returns: {valid: bool, errors: [...], warnings: [...]}
+    Returns: {valid, errors, warnings, code_blocks_checked}
     """
-    errors = []
-    warnings = []
+    errors, warnings = [], []
 
-    # Required headings per document type
-    required_headings = {
-        "":  ["Prior Release Context", "Hardware Target", "Overview", "Goals",
-              "New Constants", "Test Results", "Sub-Phase Summary"],
-        "a": ["Prior Release Context", "Overview", "Kernel Implementation",
-              "Shell Commands", "Files", "Test Coverage", "Commit Message"],
-        "b": ["Prior Release Context", "Overview", "Kernel Implementation",
-              "Shell Commands", "Files", "Test Coverage", "Commit Message"],
-        "c": ["Prior Release Context", "Overview", "Kernel Implementation",
-              "NexLib", "Documentation", "Files", "Test Coverage", "Commit Message"],
-    }
-    for heading in required_headings.get(sub_phase, []):
+    for heading in _REQUIRED_HEADINGS.get(sub_phase, []):
         if heading.lower() not in content.lower():
             errors.append(f"Missing required section: '{heading}'")
 
-    # C code block style checks
-    code_blocks = re.findall(r"```c(.*?)```", content, re.DOTALL)
+    lang_fence = f"```{language}" if language else "```"
+    code_blocks = re.findall(rf"{re.escape(lang_fence)}(.*?)```", content, re.DOTALL)
+
+    forbidden = [t.strip() for t in extra_forbidden_tokens.split(",") if t.strip()]
+    if language == "c":
+        forbidden += ["size_t", "malloc(", "free(", "printf(", "strlen("]
+        forbidden += [f"#include <{h}.h>" for h in
+                      ("string", "stdlib", "stdio", "stddef", "stdint")]
+
     for i, block in enumerate(code_blocks):
-        if "size_t" in block:
-            errors.append(f"Code block {i+1}: uses 'size_t' — use 'unsigned int' instead")
-        if re.search(r"\t", block):
-            errors.append(f"Code block {i+1}: contains tab — use 4-space indentation")
-        if re.search(r"#include\s*<(string|stdlib|stdio|stddef)\.h>", block):
-            errors.append(f"Code block {i+1}: forbidden libc include")
-        # brace-on-same-line check: detect function definitions with brace on next line
-        if re.search(r"\)\s*\n\s*\{", block):
-            warnings.append(f"Code block {i+1}: opening brace may be on its own line — style requires same-line brace")
-
-    # HWCAP collision check
-    hwcap_mentions = re.findall(r"1\s*<<\s*(\d+)", content)
-    existing = hwcap_check()
-    if "current_bits" in existing:
-        used_indices = {b["bit_index"] for b in existing["current_bits"]}
-        next_idx = existing["next_bit_index"]
-        for idx_str in hwcap_mentions:
-            idx = int(idx_str)
-            if idx < next_idx and idx in used_indices:
-                # It's referencing an existing bit — not a collision unless it claims to be new
-                pass  # allowed: referencing existing bits
-            elif idx < next_idx and idx not in used_indices:
-                warnings.append(f"Bit index {idx} (1<<{idx}) is below next_bit_index={next_idx} and not in hwcaps.h — verify intentional")
-
-    # Test assertion count floor
-    count_matches = re.findall(r"(\d+)\+?\s*/\s*(\d+)\+?", content)
-    min_floor = {"": 0, "a": 30, "b": 30, "c": 60}.get(sub_phase, 0)
-    if min_floor:
-        counts = [int(m[0]) for m in count_matches if int(m[0]) >= 1]
-        if counts:
-            if max(counts) < min_floor:
+        for token in forbidden:
+            if token in block:
+                errors.append(f"Code block {i+1}: forbidden token '{token}'")
+        if language == "c":
+            if re.search(r"\t", block):
+                errors.append(f"Code block {i+1}: tab character — use 4-space indent")
+            if re.search(r"\)\s*\n\s*\{", block):
                 warnings.append(
-                    f"Highest assertion count found ({max(counts)}) is below floor ({min_floor})"
+                    f"Code block {i+1}: opening brace may be on its own line"
+                )
+
+    # Capability-bit collision check
+    cap_result = capability_check()
+    if "current_caps" in cap_result:
+        used = {c["bit_index"] for c in cap_result["current_caps"]}
+        next_idx = cap_result["next_bit_index"]
+        for idx_str in re.findall(r"1\s*<<\s*(\d+)", content):
+            idx = int(idx_str)
+            if idx < next_idx and idx not in used:
+                warnings.append(
+                    f"Bit 1<<{idx} referenced but not in capability header "
+                    f"and below next free index ({next_idx}) — verify intentional"
+                )
+
+    # Assertion count floor
+    floor = _ASSERTION_FLOOR.get(sub_phase, 0)
+    if floor:
+        counts = [int(m) for m in re.findall(r"(\d+)\+?\s*/\s*\d+\+?", content)
+                  if int(m) >= 1]
+        if counts:
+            if max(counts) < floor:
+                warnings.append(
+                    f"Highest assertion count ({max(counts)}) is below "
+                    f"floor ({floor}) for sub-phase '{sub_phase or 'top'}'"
                 )
         else:
-            warnings.append(f"No assertion counts found — expected ≥{min_floor} assertions documented")
+            warnings.append(
+                f"No assertion counts found — expected ≥{floor} assertions documented"
+            )
 
     return {
         "valid": len(errors) == 0,
@@ -339,18 +449,36 @@ def validate_plan_file(content: str, sub_phase: str = "") -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def write_plan_file(filename: str, content: str, sub_phase: str = "") -> dict:
+def write_plan_file(
+    filename: str,
+    content: str,
+    sub_phase: str = "",
+    plan_dir: str = "",
+    language: str = "c",
+    extra_forbidden_tokens: str = "",
+) -> dict:
     """
-    Validate and write a plan document to .github/<filename>.
-    `sub_phase` is "", "a", "b", or "c" — used to pick the right validation rules.
+    Validate then write a plan document atomically.
+    Refuses to write if validation returns errors.
 
-    Returns: {success: bool, path: str, lines: int, validation: {...}}
+    Parameters:
+      filename               — e.g. "plan-R0013.md" or "plan-R0013a.md"
+      content                — full document text
+      sub_phase              — "", "a", "b", or "c"
+      plan_dir               — override auto-detected plan directory
+      language               — passed to validate_plan_file
+      extra_forbidden_tokens — passed to validate_plan_file
+
+    Returns: {success, path, lines, validation}
     """
     root = _repo_root()
-    dest = root / ".github" / filename
+    pdir = Path(plan_dir) if plan_dir else _find_plan_dir(root)
+    pdir.mkdir(parents=True, exist_ok=True)
+    dest = pdir / filename
 
-    # Validate first
-    validation = validate_plan_file(content, sub_phase)
+    validation = validate_plan_file(
+        content, sub_phase, language, extra_forbidden_tokens
+    )
     if not validation["valid"]:
         return {
             "success": False,
@@ -360,11 +488,10 @@ def write_plan_file(filename: str, content: str, sub_phase: str = "") -> dict:
         }
 
     dest.write_text(content, encoding="utf-8")
-    lines = content.count("\n") + 1
     return {
         "success": True,
         "path": str(dest),
-        "lines": lines,
+        "lines": content.count("\n") + 1,
         "validation": validation,
     }
 
@@ -374,27 +501,34 @@ def write_plan_file(filename: str, content: str, sub_phase: str = "") -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def list_plan_files() -> dict:
+def list_plan_files(plan_dir: str = "") -> dict:
     """
-    List all plan-RXXXX*.md files in .github/ with their line counts and
-    whether they form a complete set (top + a + b + c).
+    List all plan-*.md files and report whether each milestone forms a complete
+    set (top-level + a + b + c).
+
+    Parameters:
+      plan_dir — override auto-detection
+
+    Returns: {plan_dir, milestones}
     """
     root = _repo_root()
-    github = root / ".github"
-    files = sorted(github.glob("plan-R????.md")) + sorted(github.glob("plan-R?????.md"))
+    pdir = Path(plan_dir) if plan_dir else _find_plan_dir(root)
 
     milestones: dict = {}
-    for f in github.glob("plan-R*.md"):
-        m = re.match(r"plan-(R\d{4})(a|b|c)?\.md$", f.name)
+    for f in pdir.glob("plan-*.md"):
+        m = re.match(r"plan-(\w+?)(a|b|c)?\.md$", f.name)
         if not m:
             continue
         tag, sub = m.group(1), m.group(2) or ""
         if tag not in milestones:
-            milestones[tag] = {"top": False, "a": False, "b": False, "c": False, "files": []}
+            milestones[tag] = {"top": False, "a": False, "b": False, "c": False,
+                               "files": []}
         key = sub if sub else "top"
         milestones[tag][key] = True
         lines = f.read_text(encoding="utf-8").count("\n") + 1
-        milestones[tag]["files"].append({"name": f.name, "lines": lines, "sub": sub or "top"})
+        milestones[tag]["files"].append(
+            {"name": f.name, "lines": lines, "sub": sub or "top"}
+        )
 
     result = []
     for tag in sorted(milestones):
@@ -405,7 +539,8 @@ def list_plan_files() -> dict:
             "complete": complete,
             "files": sorted(d["files"], key=lambda x: x["sub"]),
         })
-    return {"milestones": result}
+
+    return {"plan_dir": str(pdir), "milestones": result}
 
 
 # ---------------------------------------------------------------------------

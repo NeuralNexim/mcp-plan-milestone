@@ -1,138 +1,145 @@
 # plan-milestone
 
-Analyse source planning and documentation artefacts for a NexTinyOS milestone, then
-generate a complete set of structured implementation-detail plan documents following
-the project standard.
+Analyse a project's roadmap and existing plan documents, then generate a complete
+set of structured implementation-detail plan files for the next milestone
+(top-level plan + three sub-plans: a, b, c).
+
+Works with any project that keeps plan documents in `.github/` (or a similar
+plans directory) and has a roadmap / development-plan file somewhere in the repo.
 
 ## Input
 
-The command accepts an optional milestone identifier argument (e.g. `R0012`, `R0013`).
-If omitted, infer the milestone from the current branch name or ask the user.
+Optional milestone identifier (e.g. `R0013`, `v3.0`, `PHASE-4`).
+If omitted, the milestone is inferred from the current branch name or you are
+asked to confirm.
 
 $ARGUMENTS
 
 ## MCP Plugin Tools
 
-This skill is backed by the **plan-milestone MCP server** (`plan_milestone_server.py`).
-Call these tools at the steps indicated — they do the file I/O and validation so you
-don't have to read/parse the files manually:
+This skill is backed by the **plan-milestone MCP server**.
+Call these tools at the steps indicated:
 
 | Tool | When to call |
 |------|-------------|
-| `mcp__plan-milestone__hwcap_check` | Step 1 — get current bits and next available index |
-| `mcp__plan-milestone__plan_template` | Step 1 — fetch latest completed milestone plans as templates |
-| `mcp__plan-milestone__milestone_entry` | Step 1 — extract the target milestone's dev-plan entry |
-| `mcp__plan-milestone__boot_sequence` | Step 1 — get kernel.c init order for slot placement |
+| `mcp__plan-milestone__capability_check` | Step 1 — get current feature-flag bits and next free slot |
+| `mcp__plan-milestone__plan_template` | Step 1 — fetch latest complete milestone plans as templates |
+| `mcp__plan-milestone__milestone_entry` | Step 1 — extract the target milestone's roadmap entry |
+| `mcp__plan-milestone__init_sequence` | Step 1 — get the startup init call order |
 | `mcp__plan-milestone__validate_plan_file` | Step 6 — validate content before writing |
 | `mcp__plan-milestone__write_plan_file` | Step 7 — validate + write atomically |
 | `mcp__plan-milestone__list_plan_files` | Any time — audit existing plan completeness |
+
+All four read tools in Step 1 are independent — call them **in parallel**.
 
 ## Procedure
 
 ### 1 — Gather source material
 
-Call all four read tools **in parallel**:
-
+Call in parallel:
 ```
-mcp__plan-milestone__hwcap_check()
-mcp__plan-milestone__plan_template()          # auto-detects latest complete milestone
+mcp__plan-milestone__capability_check()
+mcp__plan-milestone__plan_template()
 mcp__plan-milestone__milestone_entry(milestone=<target>)
-mcp__plan-milestone__boot_sequence()
+mcp__plan-milestone__init_sequence()
 ```
 
-Also read `docs/developer-manual.md` directly — it is too large for a tool and must
-be read with the Read tool to extract section structure for the doc-update spec.
+Also read the project's developer / API documentation directly (it is typically
+too large for a single tool call) to extract section structure for the doc-update
+spec in sub-plan c.
 
-### 2 — Determine sub-phase split
+### 2 — Determine the sub-phase split
 
-Identify the natural implementation boundary that splits the milestone into exactly
-**three sub-phases** (a / b / c) following this heuristic:
+Divide the milestone into exactly **three sub-phases** (a / b / c):
 
-| Sub-phase | Character |
-|-----------|-----------|
-| **a** | Core detection / hardware init / new `HWCAP_*` bits; first diagnostic command |
-| **b** | Routing / programming / mask-unmask shims; second diagnostic command |
-| **c** | Higher-level driver; `nexlib` wrapper; master test suite; all doc updates |
+| Sub-phase | Typical character |
+|-----------|------------------|
+| **a** | Detection / capability init / first new feature flag; first diagnostic |
+| **b** | Routing / programming / adapter shims; second diagnostic |
+| **c** | Higher-level integration; library wrappers; master test suite; all doc updates |
 
-Document the rationale for the split in the top-level plan's Sub-Phase Summary table.
+Adapt the split to the project's domain — the principle is that each sub-phase is
+independently reviewable and testable. Document the rationale in the top-level
+plan's Sub-Phase Summary table.
 
-### 3 — Create the top-level plan `.github/plan-RXXXX.md`
+### 3 — Draft the top-level plan
 
 Sections (in order):
 
-1. **Header** — branch name, prerequisite releases, next release.
-2. **Prior Release Context** — bullet list (10–20 items) of constants, syscall
-   numbers, struct fields, and decisions from the previous milestone that constrain
-   this one. Facts only; no code blocks; no prose.
-3. **Hardware Target** — matrix table (CPU family rows × feature columns); note if
-   the release is a no-op on older hardware.
-4. **New `HWCAP_*` bits** — table of bit name, value, and what it guards; assign
-   consecutive bit positions after the last used bit in `hwcaps.h`.
-5. **Overview** — 2–3 paragraph prose: what changes, why, fallback guarantee.
-6. **Goals** — sub-sections for Kernel mechanisms, Shell commands (table with
-   sub-phase column), NexLib, Documentation, Tests.
+1. **Header** — branch, prerequisite releases, next release.
+2. **Prior Release Context** — bullet list (10–20 items) of constants, API symbols,
+   struct fields, and decisions from the previous milestone that constrain this one.
+   Facts only; no code blocks.
+3. **Platform / Hardware Target** — matrix or list of supported targets; note if the
+   release is a no-op on older/simpler targets.
+4. **New Feature Flags** — table of flag name, value, and what it guards (if the
+   project uses capability or feature bits).
+5. **Overview** — 2–3 paragraphs: what changes, why, fallback guarantee.
+6. **Goals** — sub-sections: Core mechanisms, CLI commands (table with sub-phase
+   column), Library / SDK changes, Documentation, Tests.
 7. **New Constants & Symbols** — table: symbol, value, meaning.
 8. **Architecture Changes to Document** — table: document, section, change.
 9. **Test Results Target** — code block with per-suite pass counts and total;
    note all prior suites must remain green.
-10. **Sub-Phase Summary** — table with links to `plan-RXXXXa.md` etc. and one-line
-    summaries.
+10. **Sub-Phase Summary** — table with links to sub-plan files and one-line summaries.
 
-### 4 — Create sub-plan `.github/plan-RXXXXa.md`
+### 4 — Draft sub-plan a
 
 Sections (in order):
 
 1. **Header** — sub-phase title, branch, prerequisite.
-2. **Prior Release Context** — same format as top-level; focus on facts directly
-   relevant to this sub-phase.
+2. **Prior Release Context** — same format; focus on facts relevant to this sub-phase.
 3. **Overview** — what this sub-phase delivers and why it is self-contained.
-4. **Kernel Implementation** — detailed design per new file:
-   - Data structures (C struct definitions in code blocks).
-   - Key function signatures with brief behavioural description.
-   - Critical sequences (init order, register writes, MMIO patterns) in code blocks.
-   - EOI / interrupt-path changes if any.
-5. **Shell Commands** — for each new command: man-page-style usage, options table,
+4. **Implementation** — detailed design per new file or module:
+   - Data structures and key types (code blocks in the project's language).
+   - Key function / method signatures with brief behavioural description.
+   - Critical sequences (init order, register writes, protocol steps) in code blocks.
+   - Any interrupt / event-path or concurrency changes.
+5. **CLI / Shell Commands** — for each new command: usage synopsis, options table,
    example output block.
-6. **Updated Commands** — what existing commands change and how.
-7. **Implementation Standards** — cross-references to CLAUDE.md rules relevant to
-   this sub-phase (hwcaps gating, stream layer, no-libc).
-8. **Security** — any MMIO bounds, ACPI validation, or trust-boundary notes.
+6. **Updated Existing Components** — what changes and how.
+7. **Implementation Standards** — cross-reference to project style rules relevant
+   to this sub-phase (capability gating, IO abstraction, language constraints).
+8. **Security** — trust boundaries, input validation, access control notes.
 9. **Files Changed / Created** — table: file, new/modified, purpose.
-10. **Test Coverage** — list of test groups, assertion counts, and what each covers.
-11. **Commit Message** — verbatim `feat(RXXXXa): …` message to copy-paste.
+10. **Test Coverage** — test groups, assertion counts, what each covers.
+11. **Commit Message** — verbatim commit message to copy-paste.
 
-### 5 — Create sub-plans b and c
+### 5 — Draft sub-plans b and c
 
-Follow the same section template as sub-plan a. Sub-plan c **must also include**:
+Follow the same section template as sub-plan a.
 
-- **NexLib changes** — new functions, signature-stable upgrades, fallback behaviour.
-- **Documentation update spec** — per-section instructions for `developer-manual.md`
-  and `plan-developmentPlan.prompt.md`.
-- **Master integration test suite** — full assertion list for the combined
-  `tests/test_<topic>.c` file covering all three sub-phases (60+ assertions target).
+Sub-plan c **must also include**:
+
+- **Library / SDK changes** — new public functions, signature-stable upgrades,
+  fallback behaviour when the new feature is absent.
+- **Documentation update spec** — per-section instructions for each doc file that
+  needs updating.
+- **Master integration test suite** — full assertion list for the combined test
+  file covering all three sub-phases (target: 60+ assertions).
 
 ### 6 — Validate before writing
 
-For each document call `mcp__plan-milestone__validate_plan_file(content, sub_phase)`
-where `sub_phase` is `""`, `"a"`, `"b"`, or `"c"`.
+For each document call:
+```
+mcp__plan-milestone__validate_plan_file(content, sub_phase, language,
+                                        extra_forbidden_tokens)
+```
 
-Fix every item in `errors` before proceeding. Review `warnings` and address any that
-indicate real problems (style violations, low assertion counts).
-
-Additionally verify manually:
-- Prior-release context bullets reference real symbols visible in the template files.
-- Every new shell command documents its `HWCAP_*` gate in the help text.
+Fix every item in `errors`. Review `warnings` and address any real problems.
+Verify manually:
+- Prior-context bullets reference real symbols visible in the template files.
+- Every new CLI command documents its capability-gate or prerequisite.
+- Assertion count floors: a ≥ 30, b ≥ 30, c ≥ 60, total ≥ 120.
 
 ### 7 — Write files
 
-Use `mcp__plan-milestone__write_plan_file(filename, content, sub_phase)` for each
-document — it re-validates and writes atomically, refusing if errors remain.
+Use `mcp__plan-milestone__write_plan_file` for each document:
 
-Order:
-1. `plan-RXXXX.md`  (sub_phase `""`)
-2. `plan-RXXXXa.md` (sub_phase `"a"`)
-3. `plan-RXXXXb.md` (sub_phase `"b"`)
-4. `plan-RXXXXc.md` (sub_phase `"c"`)
+1. `plan-<TAG>.md`   — top-level (sub_phase `""`)
+2. `plan-<TAG>a.md`  — sub-phase a
+3. `plan-<TAG>b.md`  — sub-phase b
+4. `plan-<TAG>c.md`  — sub-phase c
 
 Report the `lines` value returned by each write call.
 
@@ -140,10 +147,10 @@ Report the `lines` value returned by each write call.
 
 Ask the user whether to also create the release branch and commit now.
 If yes:
-- Create branch `REL-XXXX` from `development`.
-- `git add` the four plan files only (never add `.claude/` or unrelated files).
-- Commit with message: `docs(RXXXX): add implementation plan — <one-line summary>`.
-- Push with `-u origin REL-XXXX`.
+- Create branch `REL-<TAG>` (or the project's equivalent) from the integration branch.
+- Stage the four plan files only.
+- Commit with message: `docs(<TAG>): add implementation plan — <one-line summary>`.
+- Push with `-u origin <branch>`.
 
 ## Output format
 
@@ -151,9 +158,10 @@ After all files are written, print a summary table:
 
 | File | Lines | Sub-phase |
 |------|-------|-----------|
-| plan-RXXXX.md  | N | top-level |
-| plan-RXXXXa.md | N | a |
-| plan-RXXXXb.md | N | b |
-| plan-RXXXXc.md | N | c |
+| plan-TAG.md  | N | top-level |
+| plan-TAGa.md | N | a |
+| plan-TAGb.md | N | b |
+| plan-TAGc.md | N | c |
 
-Then list the new `HWCAP_*` bits introduced and the test assertion floor for each suite.
+Then list any new capability / feature-flag bits introduced and the test assertion
+floor for each suite.
